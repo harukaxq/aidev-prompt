@@ -13,16 +13,20 @@ src/
 │       │   └── <Domain>/
 │       │       ├── core/        # 純粋関数・ドメイン知識
 │       │       │   ├── <Domain>.ts
-│       │       │   ├── policy/
-│       │       │   │   └── <Policy>.ts
-│       │       │   └── port/
-│       │       │       └── <Port>.ts
+│       │       │   └── policy/
+│       │       │       └── <Policy>.ts
 │       │       ├── command/
-│       │       │   └── <Command>/
+│       │       │   ├── <Command>/
+│       │       │   │   ├── core.ts
+│       │       │   │   └── handler.ts
+│       │       │   └── _<InternalCommand>/  # 内部専用（_prefix）
 │       │       │       ├── core.ts
 │       │       │       └── handler.ts
 │       │       └── query/
-│       │           └── <Query>/
+│       │           ├── <Query>/
+│       │           │   ├── core.ts
+│       │           │   └── handler.ts
+│       │           └── _<InternalQuery>/     # 内部専用（_prefix）
 │       │               ├── core.ts
 │       │               └── handler.ts
 │       ├── flows/               # 複数ドメインを束ねる Orchestrator
@@ -31,6 +35,13 @@ src/
 │       │   ├── repository/      # DB永続化実装
 │       │   └── service/         # 外部API連携実装
 │       ├── shared/              # ドメイン横断ユーティリティ
+│       │   ├── port/            # 抽象インターフェース
+│       │   │   ├── repository/  # リポジトリインターフェース
+│       │   │   └── service/     # サービスインターフェース
+│       │   └── container.ts     # DIコンテナ（依存関係の解決）
+│       ├── entrypoint/          # 非HTTPエントリーポイント
+│       │   ├── cron.ts          # スケジュール実行
+│       │   └── cli.ts           # CLIコマンド実行
 │       └── auth.ts              # 認証設定とヘルパー関数
 └── routes/                      # SvelteKitルーティング（HTTPレイヤー）
     ├── [ページパス]/            # ページ用ルート
@@ -47,7 +58,7 @@ src/
 ### 2.1 サーバー・クライアント分離
 - **サーバー側**: `/lib/server/` 配下にビジネスロジックを配置
 - **クライアント側**: `/lib/features/<Domain>/client/` 配下にAPI呼び出しとUI表示ヘルパーを配置
-- **DI不使用**: 各handlerで直接実装を使用（シンプルさを優先）
+- **DI使用**: shared/container.ts でPortと実装の紐付けを一元管理
 
 ### 2.2 レイヤ責務と依存方向
 
@@ -55,13 +66,42 @@ src/
 | ----------------- | --------------------------------------- | --------------------- |
 | **core/**         | ビジネスロジックを純粋関数で実装。副作用ゼロ                  |                       |
 | **policy/**       | 複数エンティティにまたがるドメイン規則                     | core/                 |
-| **port/**         | 外部との境界面（interface のみ）                   | —                     |
-| **command/query** | UseCase。直接実装を使用して副作用を実行                 | core/, adapter/       |
+| **shared/port/**  | 外部との境界面（interface のみ）                   | —                     |
+| **container.ts**  | DIコンテナ。Portと実装の紐付けを管理                    | port/, adapter/       |
+| **command/query** | UseCase。DIコンテナ経由で実装を取得                    | core/, container, shared/port/ |
 | **flows/**        | 複数ドメインの command/query を呼び出し順序を制御        | command/query         |
-| **adapter/**      | 外部サービス実装（I/O）                           | —                     |
+| **adapter/**      | 外部サービス実装（I/O）                           | shared/port/          |
+| **entrypoint/**   | 非HTTPエントリーポイント（cron, cli）                 | auth.ts, flows/, command/query |
 | **auth.ts**       | 認証設定とヘルパー関数（requireAuth, requireAdmin）    | adapter/, features/   |
 | **routes/[page]/**| ページルート（+page.server.ts でサーバー処理）        | auth.ts, flows/, command/query |
 | **routes/api/**   | 外部システム用API（webhook、モバイルアプリ等）        | auth.ts, flows/, command/query |
+
+### 2.3 ドメイン間の独立性
+
+**重要原則**: features/配下の異なるドメイン間での直接的な依存は**厳禁**です。
+
+| 禁止事項 | 理由 | 正しい実装方法 |
+| ------- | ---- | ------------ |
+| features/user から features/payment を import | ドメイン境界の破壊 | flows/ でオーケストレーション |
+| features/order から features/product/query を直接呼び出し | 密結合の発生 | flows/order-product で結合 |
+| features間での型の共有 | 変更の波及範囲拡大 | shared/types に共通型を配置 |
+
+**実装例**:
+```ts
+// ❌ 悪い例: features/order/command/create-order/handler.ts
+import { getProduct } from '../../../product/query/get-product/handler' // 禁止！
+
+// ✅ 良い例: flows/create-order-with-products/handler.ts
+import { createOrder } from '../../features/order/command/create-order/handler'
+import { getProduct } from '../../features/product/query/get-product/handler'
+
+export async function createOrderWithProducts(input: CreateOrderInput) {
+  const products = await Promise.all(
+    input.productIds.map(id => getProduct({ id }))
+  )
+  return await createOrder({ ...input, products })
+}
+```
 
 ---
 
@@ -107,34 +147,102 @@ src/
 * ChatModelやPrismaをそのまま返したりせず、invoke()や、query()などのメソッドを公開する
 * adapter/repositoryにはリポジトリを定義。DBへのアクセスはRepository経由で行う
 * adapter/serviceにはサービスを定義。LLM呼び出しや、外部API呼び出しはService経由で行う
-* features/{Domain}/port/にProductRepositoryや、PaymentServiceなどの抽象化層を作成し実態をadapterに記述 
+* shared/port/repository/にProductRepositoryなど、shared/port/service/にPaymentServiceなどの抽象化層を作成し実態をadapterに記述 
 
 ### 3.5 policy/
 * core/で使う制約などを記載
 * 単純すぎるものはcore/<Domain>.tsでチェックする
 * 例えばOrderにCouponが設定できるかチェックする(canApplyCoupon)など
 
+### 3.6 認証設計
+* **ライブラリ依存**: 認証ロジックは基本的にライブラリ（Lucia、Auth.js等）に任せる
+* **最小限のUser実装**: 他のModelで参照するため、必要最小限のUserエンティティのみ実装
+* **auth.ts**: 認証ヘルパー関数（requireAuth, requireAdmin）を集約
+* **セッション管理**: ライブラリの機能を使用、独自実装は避ける
+* **実装例**:
+  ```ts
+  // src/lib/server/features/user/core/user.ts
+  export type User = {
+    id: string
+    email: string
+    name: string
+    role: 'user' | 'admin'
+  }
+  ```
+
+### 3.7 内部専用command/queryの命名規則
+* **_prefix**: flow、entrypoint、routesに公開しないcommand/queryは`_`で開始
+* **目的**: Model内部でのみ使用するコマンドを明確に区別
+* **例**:
+  - `_sync-cache`: キャッシュ同期（内部処理）
+  - `_calculate-stats`: 統計計算（他のcommandから呼ばれる）
+  - `_validate-data`: データ検証（内部利用のみ）
+* **利用制限**: _prefixのcommand/queryはfeature外から直接呼び出し禁止
+
 ---
 
 ## 4. 実装パターン
 
-### 4.1 Handler実装パターン
+### 4.1 DIコンテナ実装パターン
+
+```ts
+// src/lib/server/shared/container.ts
+import type { UserRepository } from './port/repository/userRepository'
+import type { PaymentService } from './port/service/paymentService'
+import { UserRepositoryPrisma } from '../adapter/repository/userRepository.prisma'
+import { PaymentServiceStripe } from '../adapter/service/paymentService.stripe'
+
+// シングルトンインスタンスの管理
+class Container {
+  private static instances = new Map<string, any>()
+
+  static getUserRepository(): UserRepository {
+    const key = 'UserRepository'
+    if (!this.instances.has(key)) {
+      this.instances.set(key, new UserRepositoryPrisma())
+    }
+    return this.instances.get(key)
+  }
+
+  static getPaymentService(): PaymentService {
+    const key = 'PaymentService'
+    if (!this.instances.has(key)) {
+      this.instances.set(key, new PaymentServiceStripe())
+    }
+    return this.instances.get(key)
+  }
+
+  // テスト用: 実装を差し替える
+  static override<T>(key: string, instance: T): void {
+    this.instances.set(key, instance)
+  }
+
+  // テスト用: コンテナをリセット
+  static reset(): void {
+    this.instances.clear()
+  }
+}
+
+export { Container }
+```
+
+### 4.2 Handler実装パターン
 
 ```ts
 // src/lib/server/features/user/command/record-login/handler.ts
-import { UserRepositoryPrisma } from '../../../adapter/repository/userRepository.prisma'
+import { Container } from '../../../shared/container'
 import type { RecordLoginInput } from './core'
 
-// 実装を直接取得
-const userRepository = new UserRepositoryPrisma()
-
 export async function recordLogin(input: RecordLoginInput) {
+  // DIコンテナから実装を取得
+  const userRepository = Container.getUserRepository()
+  
   // ビジネスロジック
   return await userRepository.createLoginRecord(/* ... */)
 }
 ```
 
-### 4.2 ページルート実装パターン（推奨）
+### 4.3 ページルート実装パターン（推奨）
 
 ```ts
 // src/routes/admin/user/+page.server.ts
@@ -162,7 +270,7 @@ export const actions: Actions = {
 }
 ```
 
-### 4.3 APIルート実装パターン（特殊ケースのみ）
+### 4.4 APIルート実装パターン（特殊ケースのみ）
 
 ```ts
 // src/routes/api/lineworks/callback/+server.ts
@@ -176,14 +284,14 @@ export const POST: RequestHandler = async ({ request }) => {
 }
 ```
 
-### 4.4 Adapter(Service)
+### 4.5 Adapter(Service)
 
 
 #### インターフェイス
 必ずportにInterfaceを置く
 
 ```ts
-// src/lib/server/features/discord/port/discordService.ts
+// src/lib/server/shared/port/service/discordService.ts
 
 export interface DiscordService {
   // チャンネル情報の取得
@@ -231,6 +339,84 @@ export class DiscordServicePrisma implements DiscordService {
 }
 ```
 
+### 4.6 スケジュール実行（cron）実装パターン
+
+```ts
+// src/lib/server/entrypoint/cron.ts
+import { cleanupExpiredSessions } from '../features/auth/command/cleanup-expired-sessions/handler'
+import { sendDailyReport } from '../flows/daily-report/handler'
+import cron from 'node-cron'
+
+// 毎時0分に期限切れセッションをクリーンアップ
+cron.schedule('0 * * * *', async () => {
+  console.log('Running expired session cleanup...')
+  try {
+    const result = await cleanupExpiredSessions()
+    console.log(`Cleaned up ${result.count} expired sessions`)
+  } catch (error) {
+    console.error('Failed to cleanup sessions:', error)
+  }
+})
+
+// 毎日午前9時にレポートを送信
+cron.schedule('0 9 * * *', async () => {
+  console.log('Sending daily report...')
+  try {
+    await sendDailyReport()
+    console.log('Daily report sent successfully')
+  } catch (error) {
+    console.error('Failed to send daily report:', error)
+  }
+})
+
+// プロセス終了時のクリーンアップ
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...')
+  process.exit(0)
+})
+```
+
+### 4.7 CLI実装パターン
+
+```ts
+// src/lib/server/entrypoint/cli.ts
+import { createAdminUser } from '../features/admin/command/create-admin-user/handler'
+import { reindexSearchData } from '../features/search/command/reindex-data/handler'
+
+const command = process.argv[2]
+const args = process.argv.slice(3)
+
+async function main() {
+  switch (command) {
+    case 'create-admin':
+      const [email, name] = args
+      if (!email || !name) {
+        console.error('Usage: cli.ts create-admin <email> <name>')
+        process.exit(1)
+      }
+      const user = await createAdminUser({ email, name })
+      console.log('Admin user created:', user)
+      break
+
+    case 'reindex':
+      console.log('Starting search index rebuild...')
+      const result = await reindexSearchData()
+      console.log(`Reindexed ${result.count} documents`)
+      break
+
+    default:
+      console.error('Unknown command:', command)
+      console.error('Available commands: create-admin, reindex')
+      process.exit(1)
+  }
+}
+
+main().catch(error => {
+  console.error('Command failed:', error)
+  process.exit(1)
+})
+```
+
 ---
 
 ## 5. テスト戦略
@@ -238,15 +424,19 @@ export class DiscordServicePrisma implements DiscordService {
 | 階層             | テスト種類     | 特徴                    |
 | -------------- | --------- | --------------------- |
 | core/          | ユニット      | モック不要。DB/IO を使わない     |
-| command/query/ | ユニット      | Port をダミー実装で注入        |
+| command/query/ | ユニット      | Container.override()でモック注入 |
 | flows/         | 統合 or E2E | 実際の command/query を結合 |
 | adapter/       | 契約テスト     | モックサーバで外部 API を stub  |
+| entrypoint/    | 統合         | 実際のhandler呼び出しを検証     |
 
 
 ## 6. CI ルール
 
 1. **型チェック**: Prisma スキーマ変更後 `bun run db:generate` を必ず走らせる。
-2. **依存監視**: `eslint-plugin-boundaries` で features → adapter 直 import を禁止。
+2. **依存監視**: `eslint-plugin-boundaries` で以下を禁止:
+   - features → adapter 直 import
+   - features/<DomainA> → features/<DomainB> のクロスドメイン依存
+   - _prefix付きcommand/queryのfeature外からの呼び出し
 3. **行数監視**: `handler.ts` は 200 行、`core/*.ts` は 300 行を閾値とし超過で警告。
 
 ---
@@ -264,6 +454,21 @@ A. webhook、外部アプリ（モバイル、WOFF等）、サードパーティ
 
 **Q. 既存の /api/admin/ エンドポイントはどうすべき？**
 A. 段階的に対応する +page.server.ts へ移行。新規機能は最初から +page.server.ts で実装。
+
+**Q. なぜ entrypoint/ にapi.tsを置かない？**
+A. APIエンドポイントはSvelteKitのroutes/api/で管理すべきで、entrypointは非HTTPのエントリーポイント（cron、cli）専用です。
+
+**Q. DIコンテナはいつ使うべき？**
+A. adapter実装の差し替えが必要な場合（テスト、環境別設定）に使用。単純なケースでは過度な抽象化を避けます。
+
+**Q. _prefixのcommand/queryはどこから呼べる？**
+A. 同一feature内の他のcommand/queryからのみ。flows、entrypoint、routesからの直接呼び出しは禁止です。
+
+**Q. features/user から features/payment の機能を使いたい場合は？**
+A. 直接importは禁止。flows/user-payment/handler.ts を作成し、そこで両ドメインのcommand/queryを組み合わせます。
+
+**Q. 複数のfeatureで使う共通の型はどこに置く？**
+A. shared/types/ に配置。ただし、ドメイン固有の型は各feature内に留め、真に共通な型のみを共有します。
 
 ---
 
@@ -303,8 +508,6 @@ A. 段階的に対応する +page.server.ts へ移行。新規機能は最初か
       src/features/user/
       ├── core/
       │   └── user.ts
-      ├── port/
-      │   └── userRepository.ts
       ├── command/
       │   └── create-user/
       │       ├── core.ts
@@ -320,8 +523,16 @@ A. 段階的に対応する +page.server.ts へ移行。新規機能は最初か
       └── user-payment/
           └── handler.ts
       ```
+    - 例 (shared/port/):
+      ```
+      src/shared/port/
+      ├── repository/
+      │   └── userRepository.ts
+      └── service/
+          └── paymentService.ts
+      ```
   - Domainスケッチ: 全core/のエンティティと関数をドキュメントに記す。
-  - command/query/とflows/設計: 全Domainのcoreとportを基にUseCaseを組み合わせ。handlerで直接インスタンス。複数ドメインのflowsをここで設計（2つ以上結合時）。
+  - command/query/とflows/設計: 全Domainのcoreとshared/portを基にUseCaseを組み合わせ。handlerで直接インスタンス。複数ドメインのflowsをここで設計（2つ以上結合時）。
   - ドキュメント更新: `docs/usecases.md`にシーケンス（テキストで「入力 → core → adapter」）。
     - **おすすめ内容**:
       - **UseCaseカタログ**: 表 (コマンド名 | 入力型 | 出力型 | 依存Port | ルール)。
@@ -333,14 +544,14 @@ A. 段階的に対応する +page.server.ts へ移行。新規機能は最初か
 - **目的**: 全Domainからportのインターフェイスを決定。依存方向を明確に。
 - **手順**:
   - core/設計: Prismaスキーマを最小定義。全core/<Domain>.tsをスケッチ。
-  - port/設計: coreのニーズからインターフェイス導出（例: createメソッドだけ）。
+  - port/設計: coreのニーズからインターフェイス導出（例: createメソッドだけ）。shared/port/に集約配置。
   - ドキュメント更新: `docs/interfaces.md`を作成。Portのコードスニペットと理由を記述。
     - **おすすめ内容**:
       - **Portカタログ**: 表 (メソッド名 | 入力 | 出力 | 目的)。
       - **依存フロー**: テキストで「core → port → adapter」と記述。
 - **例コード** (port/):
   ```ts
-  // src/features/user/port/userRepository.ts
+  // src/lib/server/shared/port/repository/userRepository.ts
   export interface UserRepository {
     create(user: { name: string }): Promise<{ id: string; name: string }>;
   }
@@ -367,9 +578,9 @@ A. 段階的に対応する +page.server.ts へ移行。新規機能は最初か
       - **Mockガイド**: サンプルコード。
 - **例コード** (adapter/):
   ```ts
-  // src/adapter/repository/userRepository.prisma.ts
+  // src/lib/server/adapter/repository/userRepository.prisma.ts
   import { PrismaClient } from '@prisma/client';
-  import { UserRepository } from '../../features/user/port/userRepository';
+  import { UserRepository } from '../../shared/port/repository/userRepository';
 
   const prisma = new PrismaClient();
 
@@ -427,7 +638,7 @@ A. 段階的に対応する +page.server.ts へ移行。新規機能は最初か
   - core/policy/command/queryのニーズからinterfaceを定義/修正（例: 新メソッド追加）。
   - メソッドを最小限に（入力/出力型明確）。
   - ドキュメント更新: `docs/interfaces.md` にPortカタログ追加（表: メソッド名 | 入力 | 出力 | 目的）。
-- **対象ファイル**: src/features/<Domain>/port/<Port>.ts
+- **対象ファイル**: src/lib/server/shared/port/{repository,service}/<Port>.ts
 - **Tips**: interface推奨。adapterの実装前にportを固めることで、依存逆転を実現。
 
 #### ステップ4: adapter/ の具体クラス実装
