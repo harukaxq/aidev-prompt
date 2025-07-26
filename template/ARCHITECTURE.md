@@ -416,6 +416,178 @@ main().catch(error => {
   process.exit(1)
 })
 ```
+### 4.8 Mastra AgentServiceの実装例
+
+Mastraフレームワークを使用したAIエージェントサービスの実装例です。
+
+#### インターフェイス定義
+```ts
+// src/lib/server/shared/port/service/agentService.ts
+export interface Tool {
+  name: string
+  description: string
+  parameters: Record<string, any>
+  execute: (params: any) => Promise<any>
+}
+
+export interface Message {
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string
+  name?: string // tool messageの場合のtool名
+  tool_call_id?: string // tool_resultの場合の対応ID
+}
+
+export interface AgentService {
+  // LLMを呼び出してtoolを実行
+  invoke(
+    messages: Message[],
+    tools: Tool[]
+  ): Promise<Message[]> // 生成されたすべてのメッセージを返す
+}
+```
+
+#### Adapter実装（Mastra使用）
+```ts
+// src/lib/server/adapter/service/agent.service.ts
+import { Agent } from '@mastra/core/agent'
+import { createTool } from '@mastra/core/tools'
+import { openai } from '@ai-sdk/openai'
+import type { AgentService, Message, Tool } from '../../features/agent/port/agentService'
+import { z } from 'zod'
+
+export class AgentServiceMastra implements AgentService {
+  private agent: Agent
+
+  constructor() {
+    const apiKey = process.env.OPENAI_API_KEY || ''
+    if (!apiKey) {
+      throw new Error('OPENAI_API_KEY environment variable is required')
+    }
+
+    // Agentの初期化
+    this.agent = new Agent({
+      name: 'kurashi-tech-agent',
+      instructions: 'あなたは医療介護・看護事務作業をサポートするアシスタントです。',
+      model: openai('gpt-4o'),
+    })
+  }
+
+  async invoke(messages: Message[], tools: Tool[]): Promise<Message[]> {
+    try {
+      // ToolsをMastraのcreateToolフォーマットに変換
+      const mastraTools: Record<string, any> = {}
+      
+      for (const tool of tools) {
+        mastraTools[tool.name] = createTool({
+          id: tool.name,
+          description: tool.description,
+          inputSchema: z.object(tool.parameters.properties || {}).passthrough(),
+          execute: async ({ context }) => {
+            return await tool.execute(context)
+          }
+        })
+      }
+
+      // メッセージ収集用配列
+      const generatedMessages: Message[] = []
+
+      // 動的にtoolsを設定したエージェントを作成
+      const agentWithTools = new Agent({
+        name: this.agent.name,
+        instructions: await this.agent.getInstructions(),
+        model: await this.agent.getModel(),
+        tools: mastraTools
+      })
+
+      // エージェントを使用してレスポンスを生成
+      const response = await agentWithTools.generate(
+        messages.map(msg => ({
+          role: msg.role as 'user' | 'assistant' | 'system',
+          content: msg.content
+        })),
+        {
+          maxSteps: 5,
+          onStepFinish: ({ toolCalls, toolResults }) => {
+            // tool呼び出しとその結果を記録
+            if (toolCalls) {
+              for (const toolCall of toolCalls) {
+                generatedMessages.push({
+                  role: 'tool',
+                  content: JSON.stringify(toolCall.args),
+                  name: toolCall.toolName,
+                  tool_call_id: `call_${Date.now()}_${Math.random().toString(36).substring(7)}`
+                })
+              }
+            }
+            if (toolResults) {
+              for (const toolResult of toolResults) {
+                generatedMessages.push({
+                  role: 'tool',
+                  content: JSON.stringify(toolResult.result),
+                  tool_call_id: toolResult.toolCallId
+                })
+              }
+            }
+          }
+        }
+      )
+
+      // 最終的なassistantメッセージを追加
+      if (response.text) {
+        generatedMessages.push({
+          role: 'assistant',
+          content: response.text
+        })
+      }
+
+      return generatedMessages
+    } catch (error) {
+      console.error('AgentService invoke error:', error)
+      return [{
+        role: 'assistant',
+        content: 'エラーが発生しました。申し訳ございませんが、もう一度お試しください。'
+      }]
+    }
+  }
+}
+```
+
+#### Handler実装例
+```ts
+// src/lib/server/features/agent/command/process-request/handler.ts
+import { AgentServiceMastra } from '../../../adapter/service/agent.service'
+import type { ProcessRequestInput } from './core'
+
+// 実装を直接取得
+const agentService = new AgentServiceMastra()
+
+export async function processUserRequest(input: ProcessRequestInput) {
+  const tools = [
+    {
+      name: 'search_documents',
+      description: '書類を検索する',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '検索クエリ' }
+        },
+        required: ['query']
+      },
+      execute: async (params: { query: string }) => {
+        // 実際の検索ロジック
+        return { results: ['document1', 'document2'] }
+      }
+    }
+  ]
+
+  const messages = [
+    { role: 'user' as const, content: input.userMessage }
+  ]
+
+  return await agentService.invoke(messages, tools)
+}
+```
+
 
 ---
 
