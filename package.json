@@ -10,6 +10,7 @@
     "typescript": "^5"
   },
   "scripts": {
-    "generate": "bun run generate.ts"
+    "generate": "bun run generate.ts",
+    "sync": "bun run generate.ts && bun run sync.ts"
   }
 }

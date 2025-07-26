@@ -1,3 +1,4 @@
+ultrathink
 私はアーキテクチャ(architecture)、設計テンプレート(design_template)に従った設計書を作成したいです。情報が不足している場合は、設計書を作る際に不足している情報は必ずユーザーに確認しなさい。保存可能ならspec/initial.mdにレポートを保存しなさい。
 
 
@@ -51,14 +52,15 @@ src/
 
 - シーケンス概要: {高レベルなフロー記述。例: interfaces/api → flows/handler → command/handler → adapter/repository。詳細シーケンスは実装計画書の3.2で定義。}
 - 注意点/理由: 表をシンプルに保つことで、UseCaseの全体像を素早く把握。概要に具体的な動作例を入れるのは、テンプレート使用者が「何を書くか」のモデルを提供するため。シーケンスを高レベルに留めるのは、設計段階での柔軟性を確保し、詳細を後回しにするため。
+- 公開範囲: {UseCaseごとにpublicかinternalを指定。ドメイン内に閉じているinternalの場合はUseCase名の先頭に_を付与すること。}
 }
 
-| UseCase名 | タイプ | 概要 |
-|-----------|--------|------|
-| create-user | command | ユーザー作成（入力検証後、DB保存） |
-| get-user | query | ユーザー取得（ID指定でデータ返却） |
-| user-payment | flow | ユーザー支払い処理（ユーザー認証後、決済実行） |
-| ... | ... | ... |
+| UseCase名 | タイプ | 概要 | 公開範囲 |
+|-----------|--------|------|----------|
+| create-user | command | ユーザー作成（入力検証後、DB保存） | public |
+| get-user | query | ユーザー取得（ID指定でデータ返却） | public |
+| _user-payment | flow | ユーザー支払い処理（ユーザー認証後、決済実行） | internal |
+| ... | ... | ... | ... |
 
 
 ## 5. Portカタログ

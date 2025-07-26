@@ -1,3 +1,4 @@
+ultrathink
 私はアーキテクチャ(architecture)、設計テンプレート(design_template)に従った設計書を作成したいです。情報が不足している場合は、設計書を作る際に不足している情報は必ずユーザーに確認しなさい。保存可能ならspec/initial.mdにレポートを保存しなさい。
 
 <architecture>
@@ -10,35 +11,37 @@
 
 ```text
 src/
-├── features/            # ドメインごとのビジネスロジック
-│   └── <Domain>/
-│       ├── core/        # 純粋関数・ドメイン知識
-│       │   ├── <Domain>.ts
-│       │   ├── policy/
-│       │   │   └── <Policy>.ts
-│       │   └── port/
-│       │       └── <Port>.ts
-│       ├── command/
-│       │   └── <Command>/
-│       │       ├── core.ts
-│       │       └── handler.ts
-│       └── query/
-│           └── <Query>/
-│               ├── core.ts
-│               └── handler.ts
-├── flows/               # 複数ドメインを束ねる Orchestrator
-│   └── <Flow>/handler.ts
-├── interfaces/          # エンドポイント定義 (プロトコル別)
-│   ├── api.ts
-│   ├── cron.ts
-│   └── cli.ts
-├── entrypoints/         # アプリケーション起動点
-│   └── main.server.ts
-├── adapter/             # 技術依存 (外部 API / DB / LLM …)
-│   ├── llm.ts
-│   ├── db.ts
-│   └── request.ts
-└── shared/              # ドメイン横断ユーティリティ
+├── lib/
+│   └── server/
+│       ├── features/            # ドメインごとのビジネスロジック
+│       │   └── <Domain>/
+│       │       ├── core/        # 純粋関数・ドメイン知識
+│       │       │   ├── <Domain>.ts
+│       │       │   ├── policy/
+│       │       │   │   └── <Policy>.ts
+│       │       │   └── port/
+│       │       │       └── <Port>.ts
+│       │       ├── command/
+│       │       │   └── <Command>/
+│       │       │       ├── core.ts
+│       │       │       └── handler.ts
+│       │       └── query/
+│       │           └── <Query>/
+│       │               ├── core.ts
+│       │               └── handler.ts
+│       ├── flows/               # 複数ドメインを束ねる Orchestrator
+│       │   └── <Flow>/handler.ts
+│       ├── adapter/             # 技術依存 (外部 API / DB / LLM …)
+│       │   ├── repository/      # DB永続化実装
+│       │   └── service/         # 外部API連携実装
+│       ├── shared/              # ドメイン横断ユーティリティ
+│       └── auth.ts              # 認証設定とヘルパー関数
+└── routes/                      # SvelteKitルーティング（HTTPレイヤー）
+    ├── [ページパス]/            # ページ用ルート
+    │   ├── +page.svelte         # ページコンポーネント
+    │   └── +page.server.ts      # サーバーサイド処理（load, actions）
+    └── api/                     # 外部システム用APIエンドポイント
+        └── [path]/+server.ts    # webhook、外部アプリ連携など
 ```
 
 ---
@@ -60,11 +63,28 @@ src/
 | **command/query** | UseCase。直接実装を使用して副作用を実行                 | core/, adapter/       |
 | **flows/**        | 複数ドメインの command/query を呼び出し順序を制御        | command/query         |
 | **adapter/**      | 外部サービス実装（I/O）                           | —                     |
-| **interfaces/**   | API・CLI 等のエンドポイント。直接 UseCase を呼び出す      | flows/, command/query |
+| **auth.ts**       | 認証設定とヘルパー関数（requireAuth, requireAdmin）    | adapter/, features/   |
+| **routes/[page]/**| ページルート（+page.server.ts でサーバー処理）        | auth.ts, flows/, command/query |
+| **routes/api/**   | 外部システム用API（webhook、モバイルアプリ等）        | auth.ts, flows/, command/query |
 
 ---
 
 ## 3. コーディングガイドライン
+
+### 3.0 SvelteKitルーティング設計方針
+
+#### ページルート（推奨）
+* **基本原則**: ページで使用するデータの取得・更新は `+page.server.ts` で処理
+* **load関数**: ページ表示に必要なデータを取得
+* **actions**: フォーム送信によるデータ更新処理
+* **例**: 管理画面、ユーザー画面、設定画面など
+
+#### APIルート（特殊ケースのみ）
+* `/api/` 配下は以下の特殊なケースでのみ使用：
+  * **Webhook**: 外部サービスからのコールバック（例: LINE WORKS callback）
+  * **外部アプリ連携**: モバイルアプリ、WOFFアプリなどSvelteKit外からのアクセス
+  * **サードパーティ連携**: 他システムとのAPI連携
+* **避けるべき例**: 管理画面のデータ取得・更新（→ +page.server.ts を使用）
 
 ### 3.1 core/
 
@@ -118,19 +138,49 @@ export async function recordLogin(input: RecordLoginInput) {
 }
 ```
 
-### 4.2 API使用パターン
+### 4.2 ページルート実装パターン（推奨）
 
 ```ts
-// src/routes/api/user/login/+server.ts
-import { recordLogin } from '$lib/server/interfaces/api'
+// src/routes/admin/user/+page.server.ts
+import { requireAdmin } from '$lib/server/auth'
+import { listAdminUsers } from '$lib/server/features/admin/query/list-admin-users/handler'
+import { createAdminUser } from '$lib/server/features/admin/command/create-admin-user/handler'
+import type { PageServerLoad, Actions } from './$types'
 
-export const POST: RequestHandler = async ({ request, locals }) => {
-  const result = await recordLogin({ /* ... */ })
-  return json(result)
+export const load: PageServerLoad = async (event) => {
+  await requireAdmin(event)
+  const users = await listAdminUsers()
+  return { users }
+}
+
+export const actions: Actions = {
+  create: async (event) => {
+    await requireAdmin(event)
+    const formData = await event.request.formData()
+    const user = await createAdminUser({
+      email: formData.get('email') as string,
+      name: formData.get('name') as string
+    })
+    return { success: true, user }
+  }
 }
 ```
 
-### 4.3 Adapter(Service)
+### 4.3 APIルート実装パターン（特殊ケースのみ）
+
+```ts
+// src/routes/api/lineworks/callback/+server.ts
+import type { RequestHandler } from './$types'
+
+export const POST: RequestHandler = async ({ request }) => {
+  // Webhookの署名検証
+  const signature = request.headers.get('x-works-signature')
+  // ... 外部システムからのコールバック処理
+  return new Response('OK', { status: 200 })
+}
+```
+
+### 4.4 Adapter(Service)
 
 
 #### インターフェイス
@@ -199,7 +249,7 @@ export class DiscordServicePrisma implements DiscordService {
 
 ## 6. CI ルール
 
-1. **型チェック**: Prisma スキーマ変更後 `yarn prisma generate` を必ず走らせる。
+1. **型チェック**: Prisma スキーマ変更後 `bun run db:generate` を必ず走らせる。
 2. **依存監視**: `eslint-plugin-boundaries` で features → adapter 直 import を禁止。
 3. **行数監視**: `handler.ts` は 200 行、`core/*.ts` は 300 行を閾値とし超過で警告。
 
@@ -212,6 +262,12 @@ A. Flow はドメイン横断のため別階層に切り離すことで、依存
 
 **Q. Adapter のテストは？**
 A. 外部サービスに対しては契約テスト (pact)、DB は Testcontainer で e2e を行います。
+
+**Q. いつ /api/ ルートを使うべき？**
+A. webhook、外部アプリ（モバイル、WOFF等）、サードパーティ連携のみ。管理画面などの通常のWebページは +page.server.ts を使用。
+
+**Q. 既存の /api/admin/ エンドポイントはどうすべき？**
+A. 段階的に対応する +page.server.ts へ移行。新規機能は最初から +page.server.ts で実装。
 
 ---
 
@@ -347,8 +403,8 @@ A. 外部サービスに対しては契約テスト (pact)、DB は Testcontaine
 - **手順**:
   - 要件からDB変更が必要か確認（例: 新カラム追加、テーブル作成）。
   - Prismaスキーマ（prisma/schema.prisma）を編集（例: modelにフィールド追加）。
-  - `yarn prisma generate` を実行して型ファイルを生成。
-  - `yarn prisma db push` またはマイグレーションを実行（本番環境注意）。
+  - `bun run db:generate` を実行して型ファイルを生成。
+  - `bun run db:reset` でDBをリセット、または本番環境では `bun run db:deploy` でマイグレーションを適用。
   - ドキュメント更新: `.knowledge/domains.md` や `docs/interfaces.md` にDB変更を反映（例: 新フィールドの説明）。
 - **対象ファイル**: prisma/schema.prisma
 - **Tips**: Readonly型としてcore/で再利用。不変条件はcore/のFactoryで保証。CIルールで型チェックを強制。
@@ -391,29 +447,36 @@ A. 外部サービスに対しては契約テスト (pact)、DB は Testcontaine
   - src/adapter/service/<Service>.ts
 - **Tips**: portを実装する形で依存方向を守る。外部依存（env変数など）確認。
 
-#### ステップ5: interfaces/ と entrypoints/ の実装（APIエンドポイント）
-- **目的**: エンドポイントを定義。flows/command/queryを呼び出す。
+#### ステップ5: routes/ の実装（ページルート・APIエンドポイント）
+- **目的**: SvelteKitのルーティングを実装。基本はページルート、特殊ケースのみAPI。
 - **手順**:
-  - interfaces/ : API/CLI/Cronの定義（例: api.tsにエンドポイント追加）。
-  - entrypoints/ : 起動点（main.server.ts）でルーティング設定。
-  - 直接UseCase呼び出し（flows/優先）。
-  - ドキュメント更新: `docs/usecases.md` にシーケンス追加（テキスト図: interfaces → flows → command）。
+  - **ページルート（推奨）**: routes/[page]/+page.server.ts でload関数とactionsを実装。
+    - load: ページ表示用データ取得
+    - actions: フォーム送信処理
+  - **APIルート（特殊ケースのみ）**: routes/api/**/+server.ts でwebhook等を実装。
+    - webhook、外部アプリ連携、サードパーティAPI連携のみ
+  - 認証が必要な場合は `$lib/server/auth` から `requireAuth` や `requireAdmin` をインポート。
+  - handler/flowsを直接インポートして使用（flows/優先）。
+  - ドキュメント更新: `docs/usecases.md` にシーケンス追加。
 - **対象ファイル**:
-  - src/interfaces/api.ts (or cron.ts/cli.ts)
-  - src/entrypoints/main.server.ts
-- **Tips**: サーバー側のみ。クライアント側は次ステップ。
+  - src/routes/**/+page.server.ts（ページルート）
+  - src/routes/api/**/+server.ts（APIルート - 特殊ケースのみ）
+  - src/lib/server/auth.ts（認証ヘルパー等）
+- **Tips**: ページルートではPageServerLoad、Actions型を使用。APIルートではRequestHandler型を使用。
 
-#### ステップ6: クライアント側ページ実装（UI/API呼び出し）
-- **目的**: サーバー・クライアント分離原則に基づき、UIとAPI呼び出しを実装。
+#### ステップ6: クライアント側ページ実装（UI）
+- **目的**: SvelteKitのフォームアクションを活用したUI実装。
 - **手順**:
-  - client/ : API呼び出しヘルパー/UI表示関数を実装。
-  - ページコンポーネント: UI追加（例: フォーム/表示）。
-  - API呼び出し: fetchやAxiosでinterfaces/経由。
+  - **+page.svelte**: ページコンポーネントでUI実装。
+    - フォーム送信: `use:enhance` を使用したプログレッシブエンハンスメント
+    - データ表示: load関数から受け取ったデータを表示
+  - **特殊ケースのみ**: 外部API呼び出しが必要な場合（WOFFアプリ等）
+    - client/helper.ts でAPI呼び出しヘルパーを実装
   - ドキュメント更新: `.knowledge/domains.md` にクライアント側概要追加。
 - **対象ファイル**:
-  - src/lib/features/<Domain>/client/<Helper>.ts
-  - src/routes/... (ページファイル、例: +page.svelte)
-- **Tips**: サーバー側依存せず、API経由。レスポンシブ/アクセシビリティ考慮。
+  - src/routes/**/+page.svelte（ページコンポーネント）
+  - src/lib/features/<Domain>/client/<Helper>.ts（特殊ケースのみ）
+- **Tips**: 基本はフォーム送信。SPAライクな動作が必要な特殊ケースのみAPI呼び出し。
 
 #### ステップ7: テスト実装
 - **目的**: 各レイヤの品質確保。アーキテクチャのテスト戦略に従う。
@@ -500,14 +563,15 @@ src/
 
 - シーケンス概要: {高レベルなフロー記述。例: interfaces/api → flows/handler → command/handler → adapter/repository。詳細シーケンスは実装計画書の3.2で定義。}
 - 注意点/理由: 表をシンプルに保つことで、UseCaseの全体像を素早く把握。概要に具体的な動作例を入れるのは、テンプレート使用者が「何を書くか」のモデルを提供するため。シーケンスを高レベルに留めるのは、設計段階での柔軟性を確保し、詳細を後回しにするため。
+- 公開範囲: {UseCaseごとにpublicかinternalを指定。ドメイン内に閉じているinternalの場合はUseCase名の先頭に_を付与すること。}
 }
 
-| UseCase名 | タイプ | 概要 |
-|-----------|--------|------|
-| create-user | command | ユーザー作成（入力検証後、DB保存） |
-| get-user | query | ユーザー取得（ID指定でデータ返却） |
-| user-payment | flow | ユーザー支払い処理（ユーザー認証後、決済実行） |
-| ... | ... | ... |
+| UseCase名 | タイプ | 概要 | 公開範囲 |
+|-----------|--------|------|----------|
+| create-user | command | ユーザー作成（入力検証後、DB保存） | public |
+| get-user | query | ユーザー取得（ID指定でデータ返却） | public |
+| _user-payment | flow | ユーザー支払い処理（ユーザー認証後、決済実行） | internal |
+| ... | ... | ... | ... |
 
 
 ## 5. Portカタログ

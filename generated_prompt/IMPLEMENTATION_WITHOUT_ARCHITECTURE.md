@@ -1,4 +1,5 @@
-アーキテクチャ、実装計画書に従い実装を行いなさい。保存可能ならspec/{yyyy-mm-dd-hh-mm}-{機能名}-report.mdに実装レポートをimplementation_report_templateに従って保存しなさい。
+ultrathink
+アーキテクチャ、実装計画書に従い実装を行いなさい。必ずspec/initial.mdを参照しなさい。保存可能ならspec/{yyyy-mm-dd-hh-mm}-{機能名}-report.mdに実装レポートをimplementation_report_templateに従って保存しなさい。
 
 
 
